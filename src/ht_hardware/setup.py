@@ -24,6 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'motor_driver = ht_hardware.motor_driver:main',
         ],
     },
 )
