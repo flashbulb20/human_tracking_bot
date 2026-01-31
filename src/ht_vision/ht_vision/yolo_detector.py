@@ -1,49 +1,50 @@
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, CompressedImage # CompressedImage 추가
 from geometry_msgs.msg import Point
 from cv_bridge import CvBridge
 import cv2
 from ultralytics import YOLO
-import threading  # 별도 쓰레드 사용을 위해 추가
-import sys
+import threading
+import numpy as np
 
 class YoloDetector(Node):
     def __init__(self):
         super().__init__('yolo_detector')
         
-        # 1. 모델 로드
-        self.model = YOLO('yolov8n.pt')
+        # 1. 모델 로드 (Segmentation)
+        self.model = YOLO('yolo26n-seg.pt') 
         
         # 2. ROS 설정
         self.bridge = CvBridge()
-        self.image_sub = self.create_subscription(Image, '/image_raw', self.image_callback, 10)
+        
+        # [변경점 1] CompressedImage 구독
+        # qos_profile은 기본 10이나, best_effort를 쓰면 더 빠를 수 있음 (여기선 기본 유지)
+        self.image_sub = self.create_subscription(
+            CompressedImage, 
+            '/image_raw/compressed', # v4l2_camera가 발행하는 압축 토픽
+            self.image_callback, 
+            10)
+            
         self.image_pub = self.create_publisher(Image, '/yolo_result', 10)
         self.target_pub = self.create_publisher(Point, '/target_point', 10)
 
-        # 3. 추적 변수
         self.target_id = None
         
-        # 4. 사용자 입력을 받는 별도 쓰레드 실행
         self.input_thread = threading.Thread(target=self.input_loop, daemon=True)
         self.input_thread.start()
 
-        self.get_logger().info("YOLO Detector Started. Waiting for input in terminal...")
+        self.get_logger().info("YOLO Compressed Segmentation Tracker Started.")
 
     def input_loop(self):
-        """터미널에서 지속적으로 입력을 받는 함수"""
         print("\n" + "="*40)
-        print("  [Target Selection Command]")
-        print("  - Enter Number: Track that ID (e.g., 1)")
-        print("  - Enter -1: Clear/Reset Target")
-        print("  (Check ID numbers in RQT Image View)")
+        print("  [Segmentation Tracker (Compressed)]")
+        print("  Enter ID to track (e.g., 1)")
+        print("  Enter -1 to clear")
         print("="*40 + "\n")
-
         while rclpy.ok():
             try:
-                # 사용자 입력 대기 (여기서 멈춰 있어도 영상처리는 계속됨)
                 user_input = input("Enter Target ID >> ")
-                
                 val = int(user_input)
                 if val == -1:
                     self.target_id = None
@@ -51,65 +52,68 @@ class YoloDetector(Node):
                 else:
                     self.target_id = val
                     self.get_logger().info(f"Target Set to ID: {self.target_id}")
-            except ValueError:
-                print("Invalid input! Please enter an integer.")
-            except EOFError:
-                break
+            except:
+                pass
 
     def image_callback(self, msg):
         try:
-            frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+            # [변경점 2] Compressed Image 디코딩 (cv_bridge 없이 직접 수행 - 더 빠름)
+            # 1. byte array를 numpy array로 변환
+            np_arr = np.frombuffer(msg.data, np.uint8)
+            # 2. 이미지로 디코딩 (IMREAD_COLOR)
+            frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
         except Exception as e:
+            self.get_logger().error(f"Decoding failed: {e}")
             return
 
-        # YOLO 추적 실행
-        results = self.model.track(frame, classes=[0], persist=True, verbose=False, tracker="bytetrack.yaml")
+        height, width, _ = frame.shape
         
-        target_found = False
+        # 추적 실행
+        results = self.model.track(frame, classes=[0], persist=True, verbose=False, tracker="bytetrack.yaml", retina_masks=False)
+        
         target_msg = Point()
-        target_msg.z = 0.0  # 기본값: 없음
+        target_msg.z = -1.0 
 
         for result in results:
-            if result.boxes.id is None:
+            if result.boxes.id is None or result.masks is None:
                 continue
 
             boxes = result.boxes.xyxy.cpu().numpy()
             ids = result.boxes.id.cpu().numpy()
+            masks = result.masks.xy 
 
-            for box, track_id in zip(boxes, ids):
+            for box, track_id, mask_poly in zip(boxes, ids, masks):
                 track_id = int(track_id)
                 x1, y1, x2, y2 = box
-                
-                # 시각화: 기본 박스 (초록색)
                 color = (0, 255, 0)
-                thickness = 2
                 text = f"ID: {track_id}"
 
-                # 사용자가 지정한 타겟인지 확인
                 if self.target_id is not None and track_id == self.target_id:
-                    target_found = True
-                    color = (0, 0, 255)  # 타겟은 빨간색
-                    thickness = 4
-                    text = f"TARGET {track_id}"
+                    color = (0, 0, 255)
                     
-                    # 좌표 계산 및 발행 데이터 준비
-                    cx = (x1 + x2) / 2
-                    cy = (y1 + y2) / 2
-                    target_msg.x = float(cx)
-                    target_msg.y = float(cy)
-                    target_msg.z = 1.0  # 발견됨
+                    if len(mask_poly) > 0:
+                        centroid = np.mean(mask_poly, axis=0)
+                        cx = centroid[0] / width
+                    else:
+                        cx = ((x1 + x2) / 2) / width
 
-                # 그리기 (RQT 송출용)
-                cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, thickness)
+                    mask_area_pixel = cv2.contourArea(mask_poly.astype(np.float32))
+                    mask_area_ratio = mask_area_pixel / (width * height)
+
+                    target_msg.x = float(cx)
+                    target_msg.y = float(mask_area_ratio)
+                    target_msg.z = 1.0
+                    
+                    text = f"TARGET {track_id} | Area: {mask_area_ratio:.3f}"
+                    
+                    cv2.fillPoly(frame, [mask_poly.astype(np.int32)], (0, 0, 100))
+
+                cv2.polylines(frame, [mask_poly.astype(np.int32)], True, color, 2)
                 cv2.putText(frame, text, (int(x1), int(y1)-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-        # 타겟 데이터 발행
         self.target_pub.publish(target_msg)
-        
-        # 결과 이미지 발행 (RQT용)
+        # 결과 이미지는 RQT 확인용이므로 일반 Image 메시지로 발행 (cv_bridge 필요)
         self.image_pub.publish(self.bridge.cv2_to_imgmsg(frame, "bgr8"))
-
-        # cv2.imshow는 삭제됨
 
 def main(args=None):
     rclpy.init(args=args)
