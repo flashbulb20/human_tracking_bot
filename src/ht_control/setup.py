@@ -24,6 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'tracking_controller = ht_vision.tracking_controller:main',
         ],
     },
 )

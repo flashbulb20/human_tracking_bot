@@ -25,7 +25,6 @@ setup(
     entry_points={
         'console_scripts': [
             'yolo_detector = ht_vision.yolo_detector:main',
-            'tracking_controller = ht_vision.tracking_controller:main',
         ],
     },
 )
