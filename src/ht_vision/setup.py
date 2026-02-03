@@ -24,7 +24,8 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'yolo_detector = ht_vision.yolo_detector:main',
+            'yolo_detector_pose = ht_vision.yolo_detector_pose:main',
+            'yolo_detector_seg = ht_vision.yolo_detector_seg:main',
         ],
     },
 )
