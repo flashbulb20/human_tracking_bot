@@ -32,8 +32,8 @@ def generate_launch_description():
             actions=[
                 Node(
                     package='ht_vision',
-                    executable='yolo_detector',
-                    name='yolo_detector',
+                    executable='yolo_detector_pose',
+                    name='yolo_detector_pose',
                     output='screen'
                 )
             ]
