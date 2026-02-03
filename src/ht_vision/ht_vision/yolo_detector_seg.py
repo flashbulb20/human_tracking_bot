@@ -14,7 +14,7 @@ class YoloDetector(Node):
         super().__init__('yolo_detector')
         
         # Segmentation 모델 사용
-        self.model = YOLO('yolov8n-seg.pt') 
+        self.model = YOLO('yolo26n-seg.pt') 
         
         self.bridge = CvBridge()
         self.image_sub = self.create_subscription(

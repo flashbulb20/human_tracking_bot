@@ -12,7 +12,7 @@ class YoloDetector(Node):
     def __init__(self):
         super().__init__('yolo_detector')
         
-        # Pose 모델 (관절 추정)
+        # Pose 모델 (손 들기 감지용)
         self.model = YOLO('yolov8n-pose.pt') 
         
         self.bridge = CvBridge()
@@ -25,24 +25,24 @@ class YoloDetector(Node):
         self.image_pub = self.create_publisher(Image, '/yolo_result', 10)
         self.target_pub = self.create_publisher(Point, '/target_point', 10)
 
-        # --- [추적 상태 변수] ---
+        # 상태 변수
         self.target_id = None
         self.target_hist = None
         self.last_seen_time = 0
         
-        # --- [타겟 선정(Locking) 관련 변수] ---
-        self.lock_candidate_id = None # 현재 조건을 만족 중인 후보 ID
-        self.lock_start_time = 0.0    # 조건을 만족하기 시작한 시간
-        self.LOCK_DURATION = 1.5      # 유지해야 하는 시간 (초)
-        # -----------------------------------
+        # 타겟 선정 (Locking) 변수
+        self.lock_candidate_id = None
+        self.lock_start_time = 0.0
+        self.LOCK_DURATION = 1.5  # 손 들고 1.5초 유지
 
-        self.get_logger().info("Robust Tracker Started. (Center + Hand Raise + 1.5s Hold)")
+        self.get_logger().info("Hand-Raise Tracker Started. Raise hand for 1.5s to lock!")
 
     def calc_histogram(self, image):
-        """Re-ID용 히스토그램 (중앙부 50%)"""
+        """Re-ID용 히스토그램 (상체 위주)"""
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
         h, w, _ = hsv.shape
-        center_hsv = hsv[int(h*0.25):int(h*0.75), int(w*0.25):int(w*0.75)]
+        # 상체/몸통 부분 (중앙 50%)
+        center_hsv = hsv[int(h*0.2):int(h*0.8), int(w*0.2):int(w*0.8)]
         if center_hsv.size == 0: center_hsv = hsv
         
         hist = cv2.calcHist([center_hsv], [0, 1], None, [30, 32], [0, 180, 0, 256])
@@ -54,7 +54,7 @@ class YoloDetector(Node):
         return cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL)
 
     def is_hand_raised(self, keypoints):
-        """손 들기 감지 (Trigger)"""
+        """손 들기 감지 (코보다 손목이 위에 있는지)"""
         if keypoints.conf is None: return False
         kpts = keypoints.xy[0].cpu().numpy()
         confs = keypoints.conf[0].cpu().numpy()
@@ -62,16 +62,19 @@ class YoloDetector(Node):
         NOSE = 0
         L_WRIST, R_WRIST = 9, 10
 
+        # 코가 안 보이면 판단 불가
         if confs[NOSE] < 0.5: return False 
         
         ref_y = kpts[NOSE][1]
+        
+        # Y좌표는 위로 갈수록 작아짐 (손목 < 코)
         left_raised = (confs[L_WRIST] > 0.5) and (kpts[L_WRIST][1] < ref_y)
         right_raised = (confs[R_WRIST] > 0.5) and (kpts[R_WRIST][1] < ref_y)
         
         return left_raised or right_raised
 
     def get_torso_center(self, keypoints, box):
-        """몸통 중심 반환 (안정적 추적용)"""
+        """몸통 중심 (안정적 추적)"""
         if keypoints.conf is None: return None
         kpts = keypoints.xy[0].cpu().numpy()
         confs = keypoints.conf[0].cpu().numpy()
@@ -97,7 +100,6 @@ class YoloDetector(Node):
 
         height, width, _ = frame.shape
         
-        # 추적 실행
         results = self.model.track(frame, classes=[0], persist=True, verbose=False, tracker="bytetrack.yaml")
         
         target_msg = Point()
@@ -105,9 +107,7 @@ class YoloDetector(Node):
         
         current_target_found = False
         potential_candidates = [] 
-        
-        # 이번 프레임에서 조건을 만족하는 후보가 있는지 확인용 플래그
-        frame_candidate_found = False 
+        frame_candidate_found = False
 
         for result in results:
             if result.boxes.id is None: continue
@@ -122,7 +122,6 @@ class YoloDetector(Node):
                 x1, y1 = max(0, x1), max(0, y1)
                 x2, y2 = min(width, x2), min(height, y2)
                 
-                # Re-ID용 히스토그램 추출
                 person_roi = frame[y1:y2, x1:x2]
                 if person_roi.size == 0: continue
                 roi_hist = self.calc_histogram(person_roi)
@@ -131,19 +130,18 @@ class YoloDetector(Node):
                 text = f"ID: {track_id}"
                 thickness = 2
                 
-                # 박스 중심 계산 (조건 확인용)
                 box_cx = ((x1 + x2) / 2) / width
 
                 # =========================================================
-                # [로직 1] 타겟 선정 (Locking Process)
+                # [로직 1] 타겟 선정 (손 들기 + 중앙)
                 # =========================================================
                 if self.target_id is None:
                     is_candidate = False
                     
-                    # 1. 손을 들었는가?
                     if keypoints is not None and len(keypoints) > i:
+                        # 1. 손을 들었는가?
                         if self.is_hand_raised(keypoints[i]):
-                            # 2. 화면 중앙에 있는가? (0.35 ~ 0.65)
+                            # 2. 중앙에 있는가?
                             if 0.35 < box_cx < 0.65:
                                 is_candidate = True
                     
@@ -154,40 +152,34 @@ class YoloDetector(Node):
                             elapsed = time.time() - self.lock_start_time
                             remain = max(0.0, self.LOCK_DURATION - elapsed)
                             
-                            # 시각화
+                            # 노란색 게이지 바
                             bar_width = int((x2 - x1) * (elapsed / self.LOCK_DURATION))
                             cv2.rectangle(frame, (x1, y1-25), (x1 + bar_width, y1-15), (0, 255, 255), -1) 
                             cv2.rectangle(frame, (x1, y1-25), (x2, y1-15), (255, 255, 255), 1)
-                            
                             text = f"Hold.. {remain:.1f}s"
                             color = (0, 255, 255)
 
-                            # 3. 시간 충족 -> 타겟 확정!
                             if elapsed >= self.LOCK_DURATION:
+                                # [잠금 성공]
                                 self.target_id = track_id
                                 self.target_hist = roi_hist
                                 self.lock_candidate_id = None
                                 
-                                # ▼▼▼ [핵심 수정: 즉시 추적 상태로 전환] ▼▼▼
-                                self.last_seen_time = time.time()  # 시간 갱신 (중요!)
-                                current_target_found = True        # 찾았다고 표시 (중요!)
+                                # 즉시 추적 모드 전환
+                                self.last_seen_time = time.time()
+                                current_target_found = True
                                 
-                                # 시각적 피드백도 바로 빨간색으로 변경
                                 color = (0, 0, 255)
                                 text = f"TARGET {track_id}"
                                 thickness = 4
-                                
                                 self.get_logger().info(f"Target LOCKED! ID: {track_id}")
-                                # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
-                                
                         else:
+                            # 카운트 시작
                             self.lock_candidate_id = track_id
                             self.lock_start_time = time.time()
-                    
-                    # 후보였는데 조건을 깼거나, 다른 사람인 경우 -> 타이머 초기화는 루프 밖에서 처리
 
                 # =========================================================
-                # [로직 2] 타겟 추적 (Tracking)
+                # [로직 2] 타겟 추적
                 # =========================================================
                 elif self.target_id is not None:
                     if track_id == self.target_id:
@@ -218,13 +210,12 @@ class YoloDetector(Node):
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
                 cv2.putText(frame, text, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-        # [타겟 선정 초기화 로직]
-        # 이번 프레임에서 아무도 조건을 만족하지 못했다면 후보 취소
+        # 타겟 후보 초기화 (조건 불만족 시)
         if self.target_id is None and not frame_candidate_found:
             self.lock_candidate_id = None
             self.lock_start_time = 0.0
 
-        # [로직 3] 타겟 놓침 -> Re-ID
+        # Re-ID 로직
         if self.target_id is not None and not current_target_found:
             best_match_id = None
             max_sim = 0.0
