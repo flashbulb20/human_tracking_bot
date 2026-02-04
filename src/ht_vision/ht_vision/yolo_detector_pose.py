@@ -8,43 +8,74 @@ from ultralytics import YOLO
 import numpy as np
 import time
 
+# --- [1] 칼만 필터---
+class SimpleKalmanFilter:
+    def __init__(self):
+        # 상태 변수 4개 (x, y, vx, vy), 측정 변수 2개 (x, y)
+        self.kf = cv2.KalmanFilter(4, 2)
+        self.kf.measurementMatrix = np.array([[1,0,0,0], [0,1,0,0]], np.float32)
+        self.kf.transitionMatrix = np.array([[1,0,1,0], [0,1,0,1], [0,0,1,0], [0,0,0,1]], np.float32)
+        # 공분산 행렬 초기화 (튜닝 영역)
+        self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03 # 값이 클수록 예측을 불신
+        self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.5 # 값이 클수록 측정을 불신 (YOLO 흔들림 보정)
+        
+        self.is_initialized = False
+
+    def update(self, x, y):
+        """YOLO 측정값으로 보정"""
+        measurement = np.array([[np.float32(x)], [np.float32(y)]])
+        if not self.is_initialized:
+            # 초기값 설정
+            self.kf.statePre = np.array([[x], [y], [0], [0]], np.float32)
+            self.kf.statePost = np.array([[x], [y], [0], [0]], np.float32)
+            self.is_initialized = True
+        
+        # 1. Predict (다음 상태 예측)
+        self.kf.predict()
+        # 2. Correct (측정값 반영)
+        return self.kf.correct(measurement)
+
+    def predict(self):
+        """측정값이 없을 때 예측값만 반환"""
+        if not self.is_initialized:
+            return 0.5, 0.5 # 중앙값
+        
+        prediction = self.kf.predict()
+        return prediction[0][0], prediction[1][0] # x, y 반환
+
+# -----------------------------------------------------------
+
 class YoloDetector(Node):
     def __init__(self):
         super().__init__('yolo_detector')
         
-        # Pose 모델 (손 들기 감지용)
         self.model = YOLO('yolov8n-pose.pt') 
-        
         self.bridge = CvBridge()
-        self.image_sub = self.create_subscription(
-            CompressedImage, 
-            '/image_raw/compressed', 
-            self.image_callback, 
-            10)
-            
+        self.image_sub = self.create_subscription(CompressedImage, '/image_raw/compressed', self.image_callback, 1)
         self.image_pub = self.create_publisher(Image, '/yolo_result', 10)
-        self.target_pub = self.create_publisher(Point, '/target_point', 10)
+        self.target_pub = self.create_publisher(Point, '/target_point', 1) # 큐 사이즈 1
 
         # 상태 변수
         self.target_id = None
         self.target_hist = None
         self.last_seen_time = 0
         
-        # 타겟 선정 (Locking) 변수
+        # Locking 변수
         self.lock_candidate_id = None
         self.lock_start_time = 0.0
-        self.LOCK_DURATION = 1.5  # 손 들고 1.5초 유지
+        self.LOCK_DURATION = 1.5 
 
-        self.get_logger().info("Hand-Raise Tracker Started. Raise hand for 1.5s to lock!")
+        self.kf = SimpleKalmanFilter()
+        self.last_known_pos = (0.5, 0.0) # 마지막 위치 저장 (x, area)
+        self.search_mode = False         # 수색 모드 플래그
+
+        self.get_logger().info("YOLO Tracker with Kalman Filter & Search Mode Started!")
 
     def calc_histogram(self, image):
-        """Re-ID용 히스토그램 (상체 위주)"""
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
         h, w, _ = hsv.shape
-        # 상체/몸통 부분 (중앙 50%)
         center_hsv = hsv[int(h*0.2):int(h*0.8), int(w*0.2):int(w*0.8)]
         if center_hsv.size == 0: center_hsv = hsv
-        
         hist = cv2.calcHist([center_hsv], [0, 1], None, [30, 32], [0, 180, 0, 256])
         cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
         return hist
@@ -54,42 +85,23 @@ class YoloDetector(Node):
         return cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL)
 
     def is_hand_raised(self, keypoints):
-        """손 들기 감지 (코보다 손목이 위에 있는지)"""
         if keypoints.conf is None: return False
         kpts = keypoints.xy[0].cpu().numpy()
         confs = keypoints.conf[0].cpu().numpy()
-
-        NOSE = 0
-        L_WRIST, R_WRIST = 9, 10
-
-        # 코가 안 보이면 판단 불가
+        NOSE, L_WRIST, R_WRIST = 0, 9, 10
         if confs[NOSE] < 0.5: return False 
-        
         ref_y = kpts[NOSE][1]
-        
-        # Y좌표는 위로 갈수록 작아짐 (손목 < 코)
-        left_raised = (confs[L_WRIST] > 0.5) and (kpts[L_WRIST][1] < ref_y)
-        right_raised = (confs[R_WRIST] > 0.5) and (kpts[R_WRIST][1] < ref_y)
-        
-        return left_raised or right_raised
+        return ((confs[L_WRIST] > 0.5 and kpts[L_WRIST][1] < ref_y) or 
+                (confs[R_WRIST] > 0.5 and kpts[R_WRIST][1] < ref_y))
 
     def get_torso_center(self, keypoints, box):
-        """몸통 중심 (안정적 추적)"""
         if keypoints.conf is None: return None
         kpts = keypoints.xy[0].cpu().numpy()
         confs = keypoints.conf[0].cpu().numpy()
-        
-        # 어깨(5,6), 골반(11,12)
         torso_indices = [5, 6, 11, 12]
-        valid_points = []
-        for i in torso_indices:
-            if confs[i] > 0.5: valid_points.append(kpts[i])
-        
-        if len(valid_points) >= 2:
-            return np.mean(valid_points, axis=0)[0]
-        else:
-            x1, _, x2, _ = box
-            return (x1 + x2) / 2
+        valid_points = [kpts[i] for i in torso_indices if confs[i] > 0.5]
+        if len(valid_points) >= 2: return np.mean(valid_points, axis=0)[0]
+        else: return (box[0] + box[2]) / 2
 
     def image_callback(self, msg):
         try:
@@ -99,7 +111,6 @@ class YoloDetector(Node):
             return
 
         height, width, _ = frame.shape
-        
         results = self.model.track(frame, classes=[0], persist=True, verbose=False, tracker="bytetrack.yaml")
         
         target_msg = Point()
@@ -132,69 +143,62 @@ class YoloDetector(Node):
                 
                 box_cx = ((x1 + x2) / 2) / width
 
-                # =========================================================
-                # [로직 1] 타겟 선정 (손 들기 + 중앙)
-                # =========================================================
+                # [로직 1] 타겟 선정
                 if self.target_id is None:
                     is_candidate = False
-                    
                     if keypoints is not None and len(keypoints) > i:
-                        # 1. 손을 들었는가?
                         if self.is_hand_raised(keypoints[i]):
-                            # 2. 중앙에 있는가?
                             if 0.35 < box_cx < 0.65:
                                 is_candidate = True
                     
                     if is_candidate:
                         frame_candidate_found = True
-                        
                         if self.lock_candidate_id == track_id:
                             elapsed = time.time() - self.lock_start_time
                             remain = max(0.0, self.LOCK_DURATION - elapsed)
-                            
-                            # 노란색 게이지 바
                             bar_width = int((x2 - x1) * (elapsed / self.LOCK_DURATION))
                             cv2.rectangle(frame, (x1, y1-25), (x1 + bar_width, y1-15), (0, 255, 255), -1) 
                             cv2.rectangle(frame, (x1, y1-25), (x2, y1-15), (255, 255, 255), 1)
-                            text = f"Hold.. {remain:.1f}s"
-                            color = (0, 255, 255)
-
+                            
                             if elapsed >= self.LOCK_DURATION:
-                                # [잠금 성공]
                                 self.target_id = track_id
                                 self.target_hist = roi_hist
                                 self.lock_candidate_id = None
                                 
-                                # 즉시 추적 모드 전환
+                                # [추적 시작]
                                 self.last_seen_time = time.time()
                                 current_target_found = True
+                                self.kf = SimpleKalmanFilter() # KF 초기화
+                                self.search_mode = False
                                 
                                 color = (0, 0, 255)
                                 text = f"TARGET {track_id}"
                                 thickness = 4
                                 self.get_logger().info(f"Target LOCKED! ID: {track_id}")
                         else:
-                            # 카운트 시작
                             self.lock_candidate_id = track_id
                             self.lock_start_time = time.time()
 
-                # =========================================================
                 # [로직 2] 타겟 추적
-                # =========================================================
                 elif self.target_id is not None:
                     if track_id == self.target_id:
                         current_target_found = True
                         self.last_seen_time = time.time()
+                        self.search_mode = False # 찾았으니 수색 종료
                         
                         if self.target_hist is None: self.target_hist = roi_hist
                         else: self.target_hist = 0.9 * self.target_hist + 0.1 * roi_hist
                         
-                        # 몸통 중심 추적
                         cx_pixel = self.get_torso_center(keypoints[i], box)
                         cx = cx_pixel / width 
                         
+                        # --- [KF Update] 실측값으로 칼만 필터 보정 ---
+                        self.kf.update(cx, 0) # x축만 예측
+                        # ----------------------------------------
+
                         box_area_ratio = ((x2 - x1) * (y2 - y1)) / (width * height)
-                        
+                        self.last_known_pos = (cx, box_area_ratio) # 마지막 정보 저장
+
                         target_msg.x = float(cx)
                         target_msg.y = float(box_area_ratio)
                         target_msg.z = 1.0
@@ -210,13 +214,15 @@ class YoloDetector(Node):
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
                 cv2.putText(frame, text, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-        # 타겟 후보 초기화 (조건 불만족 시)
+        # 타겟 후보 초기화
         if self.target_id is None and not frame_candidate_found:
             self.lock_candidate_id = None
             self.lock_start_time = 0.0
 
-        # Re-ID 로직
+        # [로직 3] 타겟 소실 처리 (Kalman Filter Prediction & Search Mode)
         if self.target_id is not None and not current_target_found:
+            
+            # A. Re-ID 시도
             best_match_id = None
             max_sim = 0.0
             for pid, sim in potential_candidates:
@@ -227,24 +233,41 @@ class YoloDetector(Node):
             if max_sim > 0.75:
                 self.get_logger().warn(f"Re-ID: Switched {self.target_id} -> {best_match_id}")
                 self.target_id = best_match_id
-            elif time.time() - self.last_seen_time > 5.0:
-                self.target_id = None
-                self.target_hist = None
-                cv2.putText(frame, "TARGET LOST", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
+                self.kf = SimpleKalmanFilter() # ID 바뀌면 KF 재설정
+                self.last_seen_time = time.time()
+            
+            else:
+                elapsed_lost = time.time() - self.last_seen_time
+                
+                # B. Coasting Phase (0 ~ 2초): 칼만 필터 예측값 사용
+                if elapsed_lost < 2.0:
+                    pred_x, _ = self.kf.predict()
+                    
+                    # 예측값을 유효 범위(0~1)로 클램핑
+                    pred_x = max(0.0, min(pred_x, 1.0))
+                    
+                    target_msg.x = float(pred_x)
+                    target_msg.y = float(self.last_known_pos[1]) # 거리(면적)는 마지막 값 유지
+                    target_msg.z = 1.0 # "보고 있다"고 속임
+                    
+                    cv2.putText(frame, f"PREDICTING... ({elapsed_lost:.1f}s)", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                    
+                # C. Search Phase (2 ~ 6초): 제자리 회전하며 찾기
+                elif elapsed_lost < 6.0:
+                    self.search_mode = True
+                    target_msg.z = 2.0 # [약속] 2.0은 '수색 중' 신호
+                    
+                    cv2.putText(frame, "SEARCHING...", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
+                    
+                # D. Give Up (6초 초과): 타겟 해제
+                else:
+                    self.target_id = None
+                    self.target_hist = None
+                    self.search_mode = False
+                    cv2.putText(frame, "TARGET LOST COMPLETELY", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
         self.target_pub.publish(target_msg)
         self.image_pub.publish(self.bridge.cv2_to_imgmsg(frame, "bgr8"))
-
-def main(args=None):
-    rclpy.init(args=args)
-    node = YoloDetector()
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        node.destroy_node()
-        rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

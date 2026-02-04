@@ -48,11 +48,18 @@ class TrackingController(Node):
         self.last_msg_time = current_time
         twist = Twist()
 
+        if msg.z == 2.0:
+            twist.linear.x = 0.0
+            twist.angular.z = 0.4 # 천천히 회전
+            self.cmd_vel_pub.publish(twist)
+            self.get_logger().info("Searching Mode: Rotating...")
+            return
+
         if msg.z <= 0.0:
             self.stop_robot()
             return
 
-        # --- [1. 가변 회전 게인 계산 (핵심)] ---
+        # --- [1. 가변 회전 게인 계산] ---
         # 거리가 가까울수록(면적이 클수록) 회전 민감도를 낮춤
         current_area = msg.y
         adaptive_factor = max(0.2, 1.0 - current_area) # 최소 0.2배는 보장
