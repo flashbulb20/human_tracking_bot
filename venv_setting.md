@@ -12,13 +12,13 @@ ModuleNotFoundError: No module named 'ultralytics'
 
 ## 1️⃣ venv 생성
 ```bash
-cd ~/human_tracking_ws
+cd ~/human_tracking_bot
 python3 -m venv venv
 ```
 
 ## 2️⃣ venv 활성화
 ```bash
-source ~/human_tracking_ws/venv/bin/activate
+source ~/human_tracking_bot/venv/bin/activate
 ```
 프롬프트 앞에 (venv) 가 보이면 정상입니다.
 
@@ -41,10 +41,10 @@ ROS2 빌드 후 생성되는 실행 파일은 기본적으로 시스템 Python�
 
 ### 수동 적용
 ```bash
-sed -i '1c #!/home/raspi/human_tracking_ws/venv/bin/python' \
+sed -i '1c #!/home/raspi/human_tracking_bot/venv/bin/python' \
 install/ht_vision/lib/ht_vision/yolo_detector
 
-sed -i '1c #!/home/raspi/human_tracking_ws/venv/bin/python' \
+sed -i '1c #!/home/raspi/human_tracking_bot/venv/bin/python' \
 install/ht_vision/lib/ht_vision/yolo_detector_pose
 ```
 
@@ -54,23 +54,23 @@ ROS2를 다시 빌드하면 shebang이 다시 /usr/bin/python3 로 돌아가기 
 
 ### 설정 방법
 ```bash
-nano ~/human_tracking_ws/venv/bin/activate
+nano ~/human_tracking_bot/venv/bin/activate
 ```
 맨 아래에 다음 줄 추가:
 ```bash
 # ROS2 노드가 venv Python을 사용하도록 강제
-sed -i '1c #!/home/raspi/human_tracking_ws/venv/bin/python' \
-~/human_tracking_ws/install/ht_vision/lib/ht_vision/yolo_detector_seg 2>/dev/null
+sed -i '1c #!/home/raspi/human_tracking_bot/venv/bin/python' \
+~/human_tracking_bot/install/ht_vision/lib/ht_vision/yolo_detector_seg 2>/dev/null
 
-sed -i '1c #!/home/raspi/human_tracking_ws/venv/bin/python' \
-~/human_tracking_ws/install/ht_vision/lib/ht_vision/yolo_detector_pose 2>/dev/null
+sed -i '1c #!/home/raspi/human_tracking_bot/venv/bin/python' \
+~/human_tracking_bot/install/ht_vision/lib/ht_vision/yolo_detector_pose 2>/dev/null
 ```
 이제 venv를 활성화할 때마다 자동으로 수정됩니다.
 
 ## 6️⃣ 실행 순서 (중요)
 항상 아래 순서를 지켜야 합니다.
 ```bash
-cd ~/human_tracking_ws
+cd ~/human_tracking_bot
 source venv/bin/activate
 source install/setup.bash
 ros2 run ht_vision yolo_detector_pose

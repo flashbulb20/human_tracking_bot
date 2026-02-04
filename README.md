@@ -1,4 +1,4 @@
-# 🤖 Human Tracking Robot (HT-Bot) with ROS 2 & YOLOv8
+# 🤖 Human Tracking Robot with ROS 2 & YOLOv8
 Raspberry Pi 5와 ROS 2 Jazzy를 기반으로 한 지능형 사람 추종 로봇입니다. 단순한 Bounding Box 추적을 넘어, **Pose Estimation(관절 추정)**과 **Kalman Filter(경로 예측)**를 결합하여 끊김 없는 주행 성능을 제공합니다.
 
 ## ✨ 주요 기능 (Key Features)
