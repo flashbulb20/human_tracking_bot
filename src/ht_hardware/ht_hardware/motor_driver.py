@@ -38,7 +38,7 @@ class MotorDriver(Node):
 
         # [튜닝 파라미터]
         self.max_speed = 1.0       # 최대 속도 (0.0 ~ 1.0)
-        self.turn_gain = 2.5       # 회전 민감도 (회전이 안되면 이 값을 2.0~3.0으로 높이세요!)
+        self.turn_gain = 1.5       # 회전 민감도 (회전이 안되면 이 값을 2.0~3.0으로 높이세요!)
 
     def listener_callback(self, msg):
         self.last_cmd_time = time.time() # 명령 수신 시간 갱신

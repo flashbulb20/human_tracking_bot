@@ -13,7 +13,10 @@ def generate_launch_description():
             name='v4l2_camera',
             parameters=[{
                 'video_device': '/dev/video0',
-                'image_size': [640, 480]
+                'image_size': [320, 240],
+                'frame_rate': 10.0,
+                'io_method': 'mmap',
+                'use_v4l2_buffer': True
             }],
             output='screen'
         ),
