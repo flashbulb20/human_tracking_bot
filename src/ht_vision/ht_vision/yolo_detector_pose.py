@@ -57,7 +57,7 @@ class YoloDetector(Node):
         self.last_known_pos = (0.5, 0.0)
         self.search_mode = False
 
-        self.get_logger().info("YOLO Torso Tracker (Pos + Area) Started!")
+        self.get_logger().info("YOLO Torso Visualizer Started!")
 
     def calc_histogram(self, image):
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
@@ -84,12 +84,12 @@ class YoloDetector(Node):
 
     def get_torso_properties(self, keypoints, box):
         x1, y1, x2, y2 = box
-        # 기본값 (Pose 인식 실패 시 전체 박스 사용)
+        default_box = (int(x1), int(y1), int(x2), int(y2))
         default_cx = (x1 + x2) / 2
         default_area = (x2 - x1) * (y2 - y1)
 
         if keypoints.conf is None: 
-            return default_cx, default_area
+            return default_box, default_cx, default_area
             
         kpts = keypoints.xy[0].cpu().numpy()
         confs = keypoints.conf[0].cpu().numpy()
@@ -98,21 +98,29 @@ class YoloDetector(Node):
         torso_indices = [5, 6, 11, 12]
         valid_points = [kpts[i] for i in torso_indices if confs[i] > 0.5]
         
-        if len(valid_points) >= 3: # 점 3개 이상이면 신뢰 가능
+        if len(valid_points) >= 3:
             pts = np.array(valid_points)
             min_x = np.min(pts[:, 0])
             max_x = np.max(pts[:, 0])
             min_y = np.min(pts[:, 1])
             max_y = np.max(pts[:, 1])
             
-            # 몸통 중심
+            # 약간의 여백(Padding) 추가
+            padding_x = (max_x - min_x) * 0.1
+            padding_y = (max_y - min_y) * 0.1
+            
+            tx1 = int(min_x - padding_x)
+            ty1 = int(min_y - padding_y)
+            tx2 = int(max_x + padding_x)
+            ty2 = int(max_y + padding_y)
+
+            # 좌표 유효성 검사
             cx = (min_x + max_x) / 2
-            # 몸통 면적
             area = (max_x - min_x) * (max_y - min_y)
             
-            return cx, area
+            return (tx1, ty1, tx2, ty2), cx, area
         else:
-            return default_cx, default_area
+            return default_box, default_cx, default_area
 
     def image_callback(self, msg):
         try:
@@ -140,24 +148,32 @@ class YoloDetector(Node):
 
             for i, (box, track_id) in enumerate(zip(boxes, ids)):
                 track_id = int(track_id)
-                x1, y1, x2, y2 = box.astype(int)
-                x1, y1 = max(0, x1), max(0, y1)
-                x2, y2 = min(width, x2), min(height, y2)
                 
-                person_roi = frame[y1:y2, x1:x2]
+                # 원본 박스 (전신) - 필요시 그릴 수도 있지만 여기선 몸통만 그리기 위해 계산만 해둠
+                # ox1, oy1, ox2, oy2 = box.astype(int)
+                
+                # Re-ID용 히스토그램 (전신 박스 사용이 유리함)
+                ox1, oy1, ox2, oy2 = box.astype(int)
+                ox1, oy1 = max(0, ox1), max(0, oy1)
+                ox2, oy2 = min(width, ox2), min(height, oy2)
+                
+                person_roi = frame[oy1:oy2, ox1:ox2]
                 if person_roi.size == 0: continue
                 roi_hist = self.calc_histogram(person_roi)
+
+                # t_box: (tx1, ty1, tx2, ty2) -> 몸통 좌표
+                t_box, cx_pixel, torso_area_pixel = self.get_torso_properties(keypoints[i], box)
+                tx1, ty1, tx2, ty2 = t_box
 
                 color = (0, 255, 0)
                 text = f"ID: {track_id}"
                 thickness = 2
                 
-                # 몸통 중심 및 면적 계산
-                cx_pixel, torso_area_pixel = self.get_torso_properties(keypoints[i], box)
-                
-                # 정규화
                 box_cx = cx_pixel / width  
                 box_area_ratio = torso_area_pixel / (width * height)
+                
+                # 중심점 좌표
+                cy_pixel = (ty1 + ty2) / 2
 
                 # [로직 1] 타겟 선정
                 if self.target_id is None:
@@ -172,15 +188,16 @@ class YoloDetector(Node):
                         if self.lock_candidate_id == track_id:
                             elapsed = time.time() - self.lock_start_time
                             remain = max(0.0, self.LOCK_DURATION - elapsed)
-                            bar_width = int((x2 - x1) * (elapsed / self.LOCK_DURATION))
-                            cv2.rectangle(frame, (x1, y1-25), (x1 + bar_width, y1-15), (0, 255, 255), -1) 
-                            cv2.rectangle(frame, (x1, y1-25), (x2, y1-15), (255, 255, 255), 1)
+                            
+                            # 게이지바 (몸통 박스 위에 그림)
+                            bar_width = int((tx2 - tx1) * (elapsed / self.LOCK_DURATION))
+                            cv2.rectangle(frame, (tx1, ty1-25), (tx1 + bar_width, ty1-15), (0, 255, 255), -1) 
+                            cv2.rectangle(frame, (tx1, ty1-25), (tx2, ty1-15), (255, 255, 255), 1)
                             
                             if elapsed >= self.LOCK_DURATION:
                                 self.target_id = track_id
                                 self.target_hist = roi_hist
                                 self.lock_candidate_id = None
-                                
                                 self.last_seen_time = time.time()
                                 current_target_found = True
                                 self.kf = SimpleKalmanFilter()
@@ -204,9 +221,7 @@ class YoloDetector(Node):
                         if self.target_hist is None: self.target_hist = roi_hist
                         else: self.target_hist = 0.9 * self.target_hist + 0.1 * roi_hist
                         
-                        # --- [KF Update] 실측값으로 보정 ---
                         self.kf.update(box_cx, 0)
-                        
                         self.last_known_pos = (box_cx, box_area_ratio)
 
                         target_msg.x = float(box_cx)
@@ -214,15 +229,22 @@ class YoloDetector(Node):
                         target_msg.z = 1.0
                         
                         color = (0, 0, 255)
-                        text = f"TARGET {track_id} (Torso)"
+                        text = f"TARGET {track_id}"
                         thickness = 4
                         
                     elif self.target_hist is not None:
                         sim = self.compare_histograms(self.target_hist, roi_hist)
                         potential_candidates.append((track_id, sim))
 
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
-                cv2.putText(frame, text, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                # 1. 몸통 박스 그리기
+                cv2.rectangle(frame, (tx1, ty1), (tx2, ty2), color, thickness)
+                
+                # 2. 중심점 그리기
+                center_point = (int(cx_pixel), int(cy_pixel))
+                cv2.circle(frame, center_point, 5, (0, 0, 255), -1) # 빨간 원 채우기
+                
+                # 3. 텍스트
+                cv2.putText(frame, text, (tx1, ty1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
         if self.target_id is None and not frame_candidate_found:
             self.lock_candidate_id = None
@@ -249,7 +271,7 @@ class YoloDetector(Node):
                     pred_x = max(0.0, min(pred_x, 1.0))
                     
                     target_msg.x = float(pred_x)
-                    target_msg.y = float(self.last_known_pos[1]) # 마지막 몸통 면적 유지
+                    target_msg.y = float(self.last_known_pos[1])
                     target_msg.z = 1.0
                     cv2.putText(frame, f"PREDICTING... ({elapsed_lost:.1f}s)", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
                     
